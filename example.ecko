@@ -1,0 +1,82 @@
+# outbox example - an order write and its webhook, relayed at-least-once.
+#
+# Runs fully offline and deterministically: no real HTTP call, no wall clock -
+# every timestamp and id here is fixed so the output is identical run to run.
+
+import std.sql
+import "./main.ecko"
+outbox = main
+
+db = sql.open(":memory:")
+sql.exec(db, "create table orders (id text primary key, total_cents integer not null)")
+outbox.init(db)
+
+now = 1700000000000
+
+# The write that must not go out unless the order really was saved: the order
+# row and the outbox message commit together, in one transaction, or neither
+# does.
+sql.transaction(db, fn(tx) {
+    sql.exec(tx, "insert into orders (id, total_cents) values (?, ?)", ["order-1", 4200])
+    outbox.add(
+        tx,
+        "order.created",
+        { order_id: "order-1", total_cents: 4200 },
+        { id: "msg-1", now: now },
+    )
+})
+
+# A second order whose webhook fails every time - to show retry and dead-lettering.
+sql.transaction(db, fn(tx) {
+    sql.exec(tx, "insert into orders (id, total_cents) values (?, ?)", ["order-2", 900])
+    outbox.add(
+        tx,
+        "order.created",
+        { order_id: "order-2", total_cents: 900 },
+        { id: "msg-2", now: now, max_attempts: 2 },
+    )
+})
+
+# A write that gets rolled back: order-3 must not produce an outbox message.
+try {
+    sql.transaction(db, fn(tx) {
+        sql.exec(tx, "insert into orders (id, total_cents) values (?, ?)", ["order-3", 100])
+        outbox.add(
+            tx,
+            "order.created",
+            { order_id: "order-3", total_cents: 100 },
+            { id: "msg-3", now: now },
+        )
+        error({ kind: "payment_declined", message: "card declined" })
+    })
+} catch (e) { print("order-3 not placed: " + get(e, "message")) }
+print("pending after the rollback: " + string(len(outbox.pending(db))))
+
+# The "webhook" - order-2's endpoint always refuses.
+fn deliver(msg) {
+    if msg.payload.order_id == "order-2" {
+        error({ kind: "webhook", message: "endpoint unreachable" })
+    }
+    print("delivered {msg.topic} for {msg.payload.order_id}")
+}
+
+summary1 = outbox.relay(db, deliver, { now: now })
+print("relay 1: delivered={summary1.delivered} failed={summary1.failed} dead={summary1.dead}")
+
+# order-2's backoff has not elapsed yet - relaying again right away changes nothing.
+summary2 = outbox.relay(db, deliver, { now: now })
+print("relay 2: delivered={summary2.delivered} failed={summary2.failed} dead={summary2.dead}")
+
+# Advance past the backoff window - one more failure reaches max_attempts (2).
+summary3 = outbox.relay(db, deliver, { now: now + 120000 })
+print("relay 3: delivered={summary3.delivered} failed={summary3.failed} dead={summary3.dead}")
+
+for m in outbox.dead(db) {
+    print("dead-lettered: {m.id} ({m.payload.order_id}), last error: {m.last_error.message}")
+}
+
+# Give the dead message one more chance.
+outbox.retry_dead(db, "msg-2", { now: now + 120000 })
+print("pending after retry_dead: " + string(len(outbox.pending(db))))
+
+sql.close(db)

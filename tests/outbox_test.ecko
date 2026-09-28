@@ -1,0 +1,184 @@
+# Behavioural tests for the outbox package - run offline via `ecko test`.
+#
+# Every connection is a fresh `:memory:` SQLite database, and every timestamp
+# is passed explicitly through `opts.now` - never the wall clock - so results
+# are exact and repeatable.
+
+import std.test
+import std.sql
+import "../main.ecko"
+outbox = main
+
+fn fresh_db() {
+    db = sql.open(":memory:")
+    outbox.init(db)
+    db
+}
+
+NOW = 1700000000000
+
+test.case("a message added inside a committed transaction is delivered", fn() {
+    db = fresh_db()
+    sql.transaction(db, fn(tx) {
+        outbox.add(tx, "order.created", { order_id: "o1" }, { id: "m1", now: NOW })
+    })
+    test.eq(len(outbox.pending(db)), 1)
+    delivered = []
+    summary = outbox.relay(db, fn(msg) {
+        delivered = push(delivered, msg.id)
+    }, { now: NOW })
+    test.eq(summary, { delivered: 1, failed: 0, dead: 0 })
+    test.eq(delivered, ["m1"])
+    sql.close(db)
+})
+
+test.case("a message added inside a rolled-back transaction is not delivered", fn() {
+    db = fresh_db()
+    try {
+        sql.transaction(db, fn(tx) {
+            outbox.add(tx, "order.created", { order_id: "o2" }, { id: "m2", now: NOW })
+            error({ kind: "boom", message: "rollback me" })
+        })
+    } catch (e) { test.eq(get(e, "message"), "rollback me") }
+    test.eq(outbox.pending(db), [])
+    summary = outbox.relay(db, fn(msg) null, { now: NOW })
+    test.eq(summary, { delivered: 0, failed: 0, dead: 0 })
+    sql.close(db)
+})
+
+test.case("a failing deliver retries with backoff, then dead-letters", fn() {
+    db = fresh_db()
+    outbox.add(db, "order.created", { order_id: "o3" }, { id: "m3", now: NOW, max_attempts: 3 })
+
+    # Attempt 1 fails: still pending, backed off base_backoff_ms (1000 default).
+    s1 = outbox.relay(db, fn(msg) error({ kind: "webhook", message: "down" }), { now: NOW })
+    test.eq(s1, { delivered: 0, failed: 1, dead: 0 })
+    msg1 = outbox.pending(db)[0]
+    test.eq(msg1.attempts, 1)
+    test.eq(msg1.next_attempt_at, NOW + 1000)
+    test.eq(msg1.last_error, { kind: "webhook", message: "down" })
+
+    # Too soon - the backoff window has not elapsed, so relay skips it.
+    s_early = outbox.relay(
+        db,
+        fn(msg) error({ kind: "webhook", message: "down" }),
+        { now: NOW + 1 },
+    )
+    test.eq(s_early, { delivered: 0, failed: 0, dead: 0 })
+
+    # Attempt 2 fails: backoff doubles to 2000ms.
+    s2 = outbox.relay(db, fn(msg) error({ kind: "webhook", message: "down" }), { now: NOW + 1000 })
+    test.eq(s2, { delivered: 0, failed: 1, dead: 0 })
+    msg2 = outbox.pending(db)[0]
+    test.eq(msg2.attempts, 2)
+    test.eq(msg2.next_attempt_at, NOW + 1000 + 2000)
+
+    # Attempt 3 fails: max_attempts (3) reached - dead, not rescheduled.
+    s3 = outbox.relay(db, fn(msg) error({ kind: "webhook", message: "down" }), { now: NOW + 3000 })
+    test.eq(s3, { delivered: 0, failed: 0, dead: 1 })
+    test.eq(outbox.pending(db), [])
+    dead_msg = outbox.dead(db)[0]
+    test.eq(dead_msg.id, "m3")
+    test.eq(dead_msg.attempts, 3)
+    sql.close(db)
+})
+
+test.case("one bad message does not block the rest of the batch", fn() {
+    db = fresh_db()
+    outbox.add(db, "t", { n: 1 }, { id: "good-1", now: NOW })
+    outbox.add(db, "t", { n: 2 }, { id: "bad", now: NOW + 1 })
+    outbox.add(db, "t", { n: 3 }, { id: "good-2", now: NOW + 2 })
+
+    delivered = []
+    summary = outbox.relay(db, fn(msg) {
+        if msg.id == "bad" { error({ kind: "webhook", message: "nope" }) }
+        delivered = push(delivered, msg.id)
+    }, { now: NOW + 10 })
+    test.eq(summary, { delivered: 2, failed: 1, dead: 0 })
+    test.eq(delivered, ["good-1", "good-2"])
+    remaining = outbox.pending(db)
+    test.eq(len(remaining), 1)
+    test.eq(remaining[0].id, "bad")
+    sql.close(db)
+})
+
+test.case("a delivered message is not redelivered", fn() {
+    db = fresh_db()
+    outbox.add(db, "t", { n: 1 }, { id: "once", now: NOW })
+    calls = cell(0)
+    deliver = fn(msg) {
+        cell_update(calls, fn(n) n + 1)
+    }
+    outbox.relay(db, deliver, { now: NOW })
+    outbox.relay(db, deliver, { now: NOW + 1000 })
+    outbox.relay(db, deliver, { now: NOW + 2000 })
+    test.eq(cell_get(calls), 1)
+    test.eq(outbox.pending(db), [])
+    sql.close(db)
+})
+
+test.case("relay delivers in order: oldest first", fn() {
+    db = fresh_db()
+    outbox.add(db, "t", { n: 1 }, { id: "third", now: NOW + 2000 })
+    outbox.add(db, "t", { n: 2 }, { id: "first", now: NOW })
+    outbox.add(db, "t", { n: 3 }, { id: "second", now: NOW + 1000 })
+
+    order = outbox.pending(db)
+    test.eq(map(order, fn(m) m.id), ["first", "second", "third"])
+
+    seen = []
+    outbox.relay(db, fn(msg) {
+        seen = push(seen, msg.id)
+    }, { now: NOW + 2000 })
+    test.eq(seen, ["first", "second", "third"])
+    sql.close(db)
+})
+
+test.case("retry_dead moves a dead message back to pending", fn() {
+    db = fresh_db()
+    outbox.add(db, "t", { n: 1 }, { id: "m", now: NOW, max_attempts: 1 })
+    outbox.relay(db, fn(msg) error({ kind: "x", message: "fail" }), { now: NOW })
+    test.eq(len(outbox.dead(db)), 1)
+    test.eq(outbox.pending(db), [])
+
+    outbox.retry_dead(db, "m", { now: NOW + 5000 })
+    test.eq(outbox.dead(db), [])
+    msg = outbox.pending(db)[0]
+    test.eq(msg.id, "m")
+    test.eq(msg.attempts, 0)
+    test.eq(msg.next_attempt_at, NOW + 5000)
+    test.eq(msg.last_error, null)
+
+    # It can now be delivered again.
+    s = outbox.relay(db, fn(msg) null, { now: NOW + 5000 })
+    test.eq(s, { delivered: 1, failed: 0, dead: 0 })
+    sql.close(db)
+})
+
+test.case("retry_dead on an id that is not dead throws not_found", fn() {
+    db = fresh_db()
+    outbox.add(db, "t", { n: 1 }, { id: "still-pending", now: NOW })
+    test.err(fn() outbox.retry_dead(db, "still-pending", { now: NOW }), "no dead message")
+    test.err(fn() outbox.retry_dead(db, "does-not-exist", { now: NOW }), "no dead message")
+    sql.close(db)
+})
+
+test.case("prune removes old delivered and dead messages, leaves pending alone", fn() {
+    db = fresh_db()
+    outbox.add(db, "t", { n: 1 }, { id: "delivered-old", now: NOW })
+    outbox.add(db, "t", { n: 2 }, { id: "dead-old", now: NOW, max_attempts: 1 })
+    # Not due yet at relay time NOW, so it is never handed to deliver_fn below
+    # and stays pending regardless of what deliver_fn does with the others.
+    outbox.add(db, "t", { n: 3 }, { id: "still-pending", now: NOW + 999999 })
+
+    outbox.relay(db, fn(msg) {
+        if msg.id == "dead-old" { error({ kind: "x", message: "fail" }) }
+    }, { now: NOW })
+    test.eq(len(outbox.dead(db)), 1)
+
+    removed = outbox.prune(db, NOW + 1)
+    test.eq(removed, 2)
+    test.eq(len(outbox.pending(db)), 1)
+    test.eq(outbox.dead(db), [])
+    sql.close(db)
+})

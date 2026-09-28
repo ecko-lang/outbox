@@ -1,0 +1,238 @@
+# outbox - the transactional outbox pattern over std.sql.
+#
+# Write a business row and the message you owe the outside world (send a
+# webhook, publish an event) in one database transaction, so both commit or
+# neither does. A separate `relay` call then delivers queued messages,
+# retrying with backoff on failure and dead-lettering a message once it has
+# failed too many times. One bad message never blocks the rest.
+#
+#   import std.sql
+#   import outbox
+#
+#   db = sql.open("app.db")
+#   outbox.init(db)
+#
+#   sql.transaction(db, fn(tx) {
+#       sql.exec(tx, "insert into orders (id) values (?)", [order_id])
+#       outbox.add(tx, "order.created", { order_id: order_id })
+#   })
+#
+#   summary = outbox.relay(db, fn(msg) http.post(webhook_url, msg.payload))
+#   # { delivered: 1, failed: 0, dead: 0 }
+#
+# Delivery is at-least-once, never exactly-once: a crash between a successful
+# delivery and marking the row delivered means `relay` retries the same
+# message. Every message carries a stable `id` - dedupe on it in `deliver_fn`.
+#
+# The caller owns the connection: every function here takes an already-open
+# `db` (or `tx`) handle. This package never opens, closes or configures one,
+# so it needs no capabilities of its own.
+
+import std.sql
+import std.json
+import std.uuid
+import std.time
+
+fn opt(opts, key, default) {
+    v = get(opts, key)
+    if v == null { default } else { v }
+}
+
+fn row_to_msg(row) = {
+    id: row.id,
+    topic: row.topic,
+    payload: json.decode(row.payload),
+    status: row.status,
+    attempts: row.attempts,
+    max_attempts: row.max_attempts,
+    created_at: row.created_at,
+    next_attempt_at: row.next_attempt_at,
+    delivered_at: row.delivered_at,
+    last_error: if row.last_error == null { null } else { json.decode(row.last_error) },
+}
+
+# Normalize a caught value into the package's own `{ kind, message }` shape.
+# `deliver_fn` may throw an operational map (via `error({kind, message})`) or
+# a plain prose string (a programmer mistake) - both are recorded the same way.
+fn error_shape(e) {
+    if is_map(e) {
+        { kind: get(e, "kind"), message: get(e, "message") }
+    } else {
+        { kind: null, message: string(e) }
+    }
+}
+
+# base * 2^(attempts - 1), capped at `cap`, computed by repeated doubling so it
+# stays exact integer arithmetic (no float rounding in a millisecond delay).
+fn backoff_delay(base, attempts, cap) {
+    mut delay = base
+    mut n = 1
+    while n < attempts and delay < cap {
+        delay = delay * 2
+        n = n + 1
+    }
+    if delay > cap { cap } else { delay }
+}
+
+## init(db) -> null. Creates the outbox table (and its relay index) if they do
+## not already exist. Safe to call every time your program starts.
+export fn init(db) {
+    sql.exec(
+        db,
+        "create table if not exists outbox_messages (id text primary key, topic text not null, payload text not null, status text not null, attempts integer not null default 0, max_attempts integer not null, created_at integer not null, next_attempt_at integer not null, delivered_at integer, updated_at integer not null, last_error text)",
+    )
+    sql.exec(
+        db,
+        "create index if not exists outbox_messages_relay_idx on outbox_messages (status, next_attempt_at, created_at, id)",
+    )
+    null
+}
+
+## add(db, topic, payload, opts?) -> the new message's id.
+##
+## Call this inside the same `sql.transaction` as your business write - the
+## row you are recording and the message you owe both commit together, or
+## neither does. `payload` is any JSON-serializable value.
+##
+## `opts`: `id` (a caller-supplied id, default a fresh `uuid.v7()`),
+## `max_attempts` (default `5` - how many delivery attempts `relay` makes
+## before dead-lettering this message), `now` (Unix ms, default `time.now()` -
+## inject a fixed value in tests so behavior does not depend on wall time).
+export fn add(db, topic, payload, opts = empty_map()) {
+    id = opt(opts, "id", uuid.v7())
+    max_attempts = opt(opts, "max_attempts", 5)
+    now = opt(opts, "now", time.now())
+    sql.exec(
+        db,
+        "insert into outbox_messages (id, topic, payload, status, attempts, max_attempts, created_at, next_attempt_at, delivered_at, updated_at, last_error) values (?, ?, ?, 'pending', 0, ?, ?, ?, null, ?, null)",
+        [id, topic, json.encode(payload), max_attempts, now, now, now],
+    )
+    id
+}
+
+## relay(db, deliver_fn, opts?) -> `{ delivered, failed, dead }` counts.
+##
+## Reads the pending messages whose `next_attempt_at` has arrived, oldest
+## first, and calls `deliver_fn(msg)` for each - `msg` has `id`, `topic`,
+## `payload`, `attempts`, `max_attempts`, `created_at`, `next_attempt_at`,
+## `delivered_at` and `last_error`. `deliver_fn`'s return value is ignored; it
+## signals failure by throwing.
+##
+## A message that returns normally is marked delivered. A message that throws
+## has its attempt recorded and is rescheduled with exponential backoff
+## (`base_backoff_ms * 2^(attempts - 1)`, capped at `max_backoff_ms`) until it
+## reaches the `max_attempts` set on `add`, at which point it is marked dead
+## instead of rescheduled. Each `deliver_fn` call is individually caught, so
+## one bad message is recorded and skipped rather than blocking the batch or
+## stopping the relay.
+##
+## Delivery is at-least-once: a message already marked delivered is never
+## picked up again, but a crash between a successful `deliver_fn` call and
+## that update means the same message is retried on the next `relay`. Make
+## `deliver_fn` idempotent - dedupe on `msg.id`.
+##
+## `opts`: `batch_size` (default `100`), `base_backoff_ms` (default `1000`),
+## `max_backoff_ms` (default `60000`), `now` (Unix ms, default `time.now()`).
+export fn relay(db, deliver_fn, opts = empty_map()) {
+    now = opt(opts, "now", time.now())
+    batch_size = opt(opts, "batch_size", 100)
+    base_backoff = opt(opts, "base_backoff_ms", 1000)
+    max_backoff = opt(opts, "max_backoff_ms", 60000)
+
+    rows = sql.query(
+        db,
+        "select * from outbox_messages where status = 'pending' and next_attempt_at <= ? order by created_at asc, id asc limit ?",
+        [now, batch_size],
+    )
+
+    mut delivered = 0
+    mut failed = 0
+    mut dead = 0
+
+    for row in rows {
+        msg = row_to_msg(row)
+        try {
+            deliver_fn(msg)
+            sql.exec(
+                db,
+                "update outbox_messages set status = 'delivered', delivered_at = ?, updated_at = ? where id = ?",
+                [now, now, msg.id],
+            )
+            delivered = delivered + 1
+        } catch (e) {
+            attempts = msg.attempts + 1
+            err = error_shape(e)
+            if attempts >= msg.max_attempts {
+                sql.exec(
+                    db,
+                    "update outbox_messages set status = 'dead', attempts = ?, updated_at = ?, last_error = ? where id = ?",
+                    [attempts, now, json.encode(err), msg.id],
+                )
+                dead = dead + 1
+            } else {
+                delay = backoff_delay(base_backoff, attempts, max_backoff)
+                sql.exec(
+                    db,
+                    "update outbox_messages set attempts = ?, next_attempt_at = ?, updated_at = ?, last_error = ? where id = ?",
+                    [attempts, now + delay, now, json.encode(err), msg.id],
+                )
+                failed = failed + 1
+            }
+        }
+    }
+
+    { delivered: delivered, failed: failed, dead: dead }
+}
+
+## pending(db) -> messages awaiting delivery, oldest first.
+##
+## Includes messages that already failed once and are backing off, not only
+## ones never attempted - compare `next_attempt_at` if you need to tell them
+## apart.
+export fn pending(db) {
+    rows = sql.query(
+        db,
+        "select * from outbox_messages where status = 'pending' order by created_at asc, id asc",
+    )
+    map(rows, row_to_msg)
+}
+
+## dead(db) -> messages that reached `max_attempts` and will not be retried
+## automatically, oldest first. Use `retry_dead` to give one another chance.
+export fn dead(db) {
+    rows = sql.query(
+        db,
+        "select * from outbox_messages where status = 'dead' order by created_at asc, id asc",
+    )
+    map(rows, row_to_msg)
+}
+
+## retry_dead(db, id, opts?) -> null. Moves a dead message back to pending
+## with its attempt count reset, so the next `relay` picks it up immediately.
+##
+## Throws `{ kind: "not_found", message: ... }` if `id` names no dead message.
+##
+## `opts`: `now` (Unix ms, default `time.now()`).
+export fn retry_dead(db, id, opts = empty_map()) {
+    now = opt(opts, "now", time.now())
+    affected = sql.exec(
+        db,
+        "update outbox_messages set status = 'pending', attempts = 0, next_attempt_at = ?, updated_at = ?, last_error = null where id = ? and status = 'dead'",
+        [now, now, id],
+    )
+    if affected == 0 { error({ kind: "not_found", message: "no dead message with id {id}" }) }
+    null
+}
+
+## prune(db, older_than) -> the number of rows removed.
+##
+## Deletes delivered and dead messages last touched before `older_than` (Unix
+## ms). Pending messages are never pruned, however old - they are still
+## waiting on a real outcome.
+export fn prune(db, older_than) {
+    sql.exec(
+        db,
+        "delete from outbox_messages where status in ('delivered', 'dead') and updated_at < ?",
+        [older_than],
+    )
+}

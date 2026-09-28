@@ -1,0 +1,13 @@
+# Ecko package - generated / build artifacts
+
+# `ecko pack` output
+*.zip
+
+# Dev-workflow scratch (not part of the shipped package)
+.superpowers/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
