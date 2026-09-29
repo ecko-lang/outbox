@@ -1,6 +1,6 @@
 {
   "module": "github.com/ecko-lang/outbox",
-  "version": "0.5.0",
+  "version": "0.55.0",
   "entrypoint": "main.ecko",
   "description": "Transactional outbox over std.sql: write your business row and the message you owe in the same transaction, then relay it with at-least-once delivery, retry and backoff.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
