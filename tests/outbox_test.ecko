@@ -23,7 +23,7 @@ test.case("a message added inside a committed transaction is delivered", fn() {
         outbox.add(tx, "order.created", { order_id: "o1" }, { id: "m1", now: NOW })
     })
     test.eq(len(outbox.pending(db)), 1)
-    delivered = []
+    mut delivered = []
     summary = outbox.relay(db, fn(msg) {
         delivered = push(delivered, msg.id)
     }, { now: NOW })
@@ -89,7 +89,7 @@ test.case("one bad message does not block the rest of the batch", fn() {
     outbox.add(db, "t", { n: 2 }, { id: "bad", now: NOW + 1 })
     outbox.add(db, "t", { n: 3 }, { id: "good-2", now: NOW + 2 })
 
-    delivered = []
+    mut delivered = []
     summary = outbox.relay(db, fn(msg) {
         if msg.id == "bad" { error({ kind: "webhook", message: "nope" }) }
         delivered = push(delivered, msg.id)
@@ -126,7 +126,7 @@ test.case("relay delivers in order: oldest first", fn() {
     order = outbox.pending(db)
     test.eq(map(order, fn(m) m.id), ["first", "second", "third"])
 
-    seen = []
+    mut seen = []
     outbox.relay(db, fn(msg) {
         seen = push(seen, msg.id)
     }, { now: NOW + 2000 })
