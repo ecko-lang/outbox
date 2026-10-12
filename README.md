@@ -27,6 +27,7 @@ it needs no `grant` in your `ecko.json` dependency entry.
 
 ```ecko
 import std.sql
+import std.http
 import outbox
 
 db = sql.open("app.db")
@@ -42,7 +43,8 @@ sql.transaction(db, fn(tx) {
 
 # Somewhere else - a worker loop, a cron tick - relay what is due.
 summary = outbox.relay(db, fn(msg) {
-    http.post("https://hooks.example.com/orders", json.encode(msg.payload))
+    r = http.post("https://hooks.example.com/orders", json: msg.payload)
+    if r.status >= 300 { error({ kind: "http", message: "webhook answered {r.status}" }) }
 })
 # { delivered: 1, failed: 0, dead: 0 }
 ```
