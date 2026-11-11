@@ -22,7 +22,8 @@ sql.transaction(db, fn(tx) {
         tx,
         "order.created",
         { order_id: "order-1", total_cents: 4200 },
-        { id: "msg-1", now: now },
+        id: "msg-1",
+        now: now,
     )
 })
 
@@ -33,7 +34,9 @@ sql.transaction(db, fn(tx) {
         tx,
         "order.created",
         { order_id: "order-2", total_cents: 900 },
-        { id: "msg-2", now: now, max_attempts: 2 },
+        id: "msg-2",
+        now: now,
+        max_attempts: 2,
     )
 })
 
@@ -45,7 +48,8 @@ try {
             tx,
             "order.created",
             { order_id: "order-3", total_cents: 100 },
-            { id: "msg-3", now: now },
+            id: "msg-3",
+            now: now,
         )
         error({ kind: "payment_declined", message: "card declined" })
     })
@@ -60,15 +64,15 @@ fn deliver(msg) {
     print("delivered {msg.topic} for {msg.payload.order_id}")
 }
 
-summary1 = outbox.relay(db, deliver, { now: now })
+summary1 = outbox.relay(db, deliver, now: now)
 print("relay 1: delivered={summary1.delivered} failed={summary1.failed} dead={summary1.dead}")
 
 # order-2's backoff has not elapsed yet - relaying again right away changes nothing.
-summary2 = outbox.relay(db, deliver, { now: now })
+summary2 = outbox.relay(db, deliver, now: now)
 print("relay 2: delivered={summary2.delivered} failed={summary2.failed} dead={summary2.dead}")
 
 # Advance past the backoff window - one more failure reaches max_attempts (2).
-summary3 = outbox.relay(db, deliver, { now: now + 120000 })
+summary3 = outbox.relay(db, deliver, now: now + 120000)
 print("relay 3: delivered={summary3.delivered} failed={summary3.failed} dead={summary3.dead}")
 
 for m in outbox.dead(db) {
@@ -76,7 +80,7 @@ for m in outbox.dead(db) {
 }
 
 # Give the dead message one more chance.
-outbox.retry_dead(db, "msg-2", { now: now + 120000 })
+outbox.retry_dead(db, "msg-2", now: now + 120000)
 print("pending after retry_dead: " + string(len(outbox.pending(db))))
 
 sql.close(db)
