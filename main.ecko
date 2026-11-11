@@ -234,7 +234,7 @@ export fn add(db, topic, payload, id = null, max_attempts = 5, now = null) {
 ## `deliver_fn`'s own errors are never re-thrown.
 ##
 ## example:
-##   outbox.relay(db, fn(msg) send(msg), batch_size: 50)   # {delivered: 3, failed: 0, dead: 0}
+##   outbox.relay(db, fn(msg) publish(msg), batch_size: 50)   # {delivered: 3, failed: 0, dead: 0}
 export fn relay(db, deliver_fn, batch_size = 100, base_backoff_ms = 1000, max_backoff_ms = 60000, now = null) {
     no_opts_map("relay", batch_size, "outbox.relay(db, deliver_fn, batch_size: 50, now: 0)")
     unless type_of(deliver_fn) == "function" {
